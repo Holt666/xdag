@@ -1,4 +1,4 @@
-/* pool logic, T14.191-T14.618 $DVS:time$ */
+/* pool logic, T14.191-T14.390 $DVS:time$ */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,7 +6,6 @@
 #include <math.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
-#include <float.h>
 #if defined(_WIN32) || defined(_WIN64)
 #else
 #include <netinet/in.h>
@@ -26,15 +25,12 @@
 #include "transport.h"
 #include "wallet.h"
 #include "system.h"
-#include "math.h"
 #include "utils/log.h"
 #include "utils/utils.h"
 #include "../dus/programs/dfstools/source/dfslib/dfslib_crypt.h"
 #include "../dus/programs/dar/source/include/crc.h"
 #include "uthash/utlist.h"
 #include "uthash/uthash.h"
-#include "utils/atomic.h"
-#include "time.h"
 
 //TODO: why do we need these two definitions?
 #define START_MINERS_COUNT     256
@@ -59,7 +55,7 @@ enum miner_state {
 
 struct miner_pool_data {
 	struct xdag_field id;
-	xtime_t task_time;
+	xdag_time_t task_time;
 	double prev_diff;
 	uint32_t prev_diff_count;
 	double maxdiff[CONFIRMATIONS_COUNT];
@@ -84,7 +80,7 @@ enum connection_state {
 };
 
 struct connection_pool_data {
-	xtime_t task_time;
+	xdag_time_t task_time;
 	double prev_diff;
 	uint32_t prev_diff_count;
 	double maxdiff[CONFIRMATIONS_COUNT];
@@ -103,7 +99,7 @@ struct connection_pool_data {
 	time_t balance_refreshed_time;
 	uint32_t shares_count;
 	time_t last_share_time;
-	atomic_int deleted;
+	int deleted;
 	const char* disconnection_reason;
 	xdag_hash_t last_min_hash;
 	long double mean_log_difficulty;
@@ -131,7 +127,6 @@ struct payment_data {
 xdag_hash_t g_xdag_mined_hashes[CONFIRMATIONS_COUNT];
 xdag_hash_t g_xdag_mined_nonce[CONFIRMATIONS_COUNT];
 xdag_remark_t g_pool_tag = {0};
-int g_pool_has_tag = 0;
 
 static uint32_t g_max_connections_count = START_MINERS_COUNT, g_max_miner_ip_count = START_MINERS_IP_COUNT;
 static uint32_t g_connections_per_miner_limit = DEFAUL_CONNECTIONS_PER_MINER_LIMIT;
@@ -140,7 +135,6 @@ static double g_pool_fee = 0, g_pool_reward = 0, g_pool_direct = 0, g_pool_fund 
 static struct xdag_block *g_firstb = 0, *g_lastb = 0;
 
 static int g_stop_general_mining = 1;
-extern int g_block_production_on;
 
 static struct miner_pool_data g_pool_miner;
 static struct miner_pool_data g_fund_miner;
@@ -153,17 +147,15 @@ static uint32_t g_connection_changed = 0;
 static pthread_mutex_t g_connections_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-int pay_miners(xtime_t time);
+int pay_miners(xdag_time_t time);
 void remove_inactive_miners(void);
-void block_queue_append_new(struct xdag_block *b);
-struct xdag_block *block_queue_first(void);
 
 void *general_mining_thread(void *arg);
 void *pool_net_thread(void *arg);
 void *pool_main_thread(void *arg);
 void *pool_block_thread(void *arg);
 void *pool_remove_inactive_connections(void *arg);
-void *pool_payment_thread(void *arg);
+void *pool_send_to_mainnet_thread(void *arg);
 
 void update_mean_log_diff(struct connection_pool_data *, struct xdag_pool_task *, xdag_hash_t);
 
@@ -229,17 +221,7 @@ int xdag_initialize_pool(const char *pool_arg)
 		return -1;
 	}
 
-	err = pthread_create(&th, 0, pool_payment_thread, 0);
-	if(err != 0) {
-		printf("create pool_payment_thread failed: %s\n", strerror(err));
-		return -1;
-	}
-
-	err = pthread_detach(th);
-	if(err != 0) {
-		printf("detach pool_payment_thread failed: %s\n", strerror(err));
-		return -1;
-	}
+	xdag_mess("Starting general mining thread...");
 
 	g_stop_general_mining = 0;
 
@@ -260,14 +242,12 @@ int xdag_initialize_pool(const char *pool_arg)
 
 void *general_mining_thread(void *arg)
 {
-	while(!g_block_production_on && !g_stop_general_mining) {
+	while(!g_xdag_sync_on && !g_stop_general_mining) {
 		sleep(1);
 	}
 
-	xdag_mess("Starting main blocks creation...");
-
 	while(!g_stop_general_mining) {
-		xdag_create_and_send_block(0, 0, 0, 0, 0, xdag_get_frame() << 16 | 0xffff, NULL);
+		xdag_create_block(0, 0, 0, 0, 0, xdag_main_time() << 16 | 0xffff, NULL);
 	}
 
 	xdag_mess("Stopping general mining thread...");
@@ -278,10 +258,10 @@ void *general_mining_thread(void *arg)
 /* sets pool parameters */
 int xdag_pool_set_config(const char *pool_config)
 {
-	char buf[0x100] = {0}, *lasts = NULL;
+	char buf[0x100], *lasts;
 
 	if(!g_xdag_pool) return -1;
-	strncpy(buf, pool_config, 0xff);
+	strcpy(buf, pool_config);
 
 	pool_config = strtok_r(buf, " \t\r\n:", &lasts);
 
@@ -389,8 +369,8 @@ static int open_pool_connection(const char *pool_arg)
 	struct sockaddr_in peeraddr;
 	int rcvbufsize = 1024;
 	int reuseaddr = 1;
-	char buf[0x100] = {0};
-	char *nextParam = NULL;
+	char buf[0x100];
+	char *nextParam;
 
 	// Create a socket
 	int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -409,7 +389,7 @@ static int open_pool_connection(const char *pool_arg)
 
 	// Resolve the server address (convert from symbolic name to IP number)
 	if(pool_arg != NULL){
-		strncpy(buf, pool_arg, 0xff);
+		strcpy(buf, pool_arg);
 	}
 	pool_arg = strtok_r(buf, " \t\r\n:", &nextParam);
 	if(!pool_arg) {
@@ -495,11 +475,9 @@ void *pool_net_thread(void *arg)
 	socklen_t peeraddr_len = sizeof(peeraddr);
 	int rcvbufsize = 1024;
 
-	while(!g_block_production_on) {
+	while(!g_xdag_sync_on) {
 		sleep(1);
 	}
-
-	xdag_mess("Pool starts to accept connections...");
 
 	int sock = open_pool_connection(pool_arg);
 	if(sock == INVALID_SOCKET) {
@@ -537,18 +515,17 @@ void *pool_net_thread(void *arg)
 		new_connection->connection_data.connection_descriptor.fd = fd;
 		new_connection->connection_data.connection_descriptor.events = POLLIN | POLLOUT;
 		new_connection->connection_data.connection_descriptor.revents = 0;
-		uint32_t ip = new_connection->connection_data.ip = peeraddr.sin_addr.s_addr;
-		uint16_t port = new_connection->connection_data.port = peeraddr.sin_port;
+		int ip = new_connection->connection_data.ip = peeraddr.sin_addr.s_addr;
+		new_connection->connection_data.port = peeraddr.sin_port;
 		new_connection->connection_data.connected_time = time(0);
 		new_connection->connection_data.last_share_time = new_connection->connection_data.connected_time; // we set time of last share to the current time in order to avoid immediate disconnection
-		atomic_init_int(&new_connection->connection_data.deleted, 0);
 
 		LL_APPEND(g_accept_connection_list_head, new_connection);
 		++g_connections_count;
 		pthread_mutex_unlock(&g_connections_mutex);
 
 		xdag_info("Pool  : miner %d connected from %u.%u.%u.%u:%u", g_connections_count,
-			ip & 0xff, ip >> 8 & 0xff, ip >> 16 & 0xff, ip >> 24 & 0xff, ntohs(port));
+			ip & 0xff, ip >> 8 & 0xff, ip >> 16 & 0xff, ip >> 24 & 0xff, ntohs(new_connection->connection_data.port));
 	}
 
 	return 0;
@@ -557,8 +534,6 @@ void *pool_net_thread(void *arg)
 static void close_connection(connection_list_element *connection, const char *message)
 {
 	struct connection_pool_data *conn_data = &connection->connection_data;
-	struct xdag_field id;
-	enum miner_state state = MINER_UNKNOWN;
 
 	pthread_mutex_lock(&g_connections_mutex);
 	LL_DELETE(g_connection_list_head, connection);
@@ -577,11 +552,8 @@ static void close_connection(connection_list_element *connection, const char *me
 	if(conn_data->miner) {
 		--conn_data->miner->connections_count;
 		if(conn_data->miner->connections_count == 0) {
-			state = conn_data->miner->state = MINER_ARCHIVE;
-			id = conn_data->miner->id;
-		} else {
-			state = conn_data->miner->state;
-		}	
+			conn_data->miner->state = MINER_ARCHIVE;
+		}
 	}
 	pthread_mutex_unlock(&g_connections_mutex);
 
@@ -589,8 +561,8 @@ static void close_connection(connection_list_element *connection, const char *me
 	uint16_t port = conn_data->port;
 
 	if(conn_data->miner) {
-		char address_buf[33] = {0};
-		xdag_hash2address((state == MINER_ARCHIVE ? id.data : conn_data->miner->id.data), address_buf);
+		char address_buf[33];
+		xdag_hash2address(conn_data->miner->id.data, address_buf);
 		xdag_info("Pool: miner %s disconnected from %u.%u.%u.%u:%u by %s", address_buf,
 			ip & 0xff, ip >> 8 & 0xff, ip >> 16 & 0xff, ip >> 24 & 0xff, ntohs(port), message);
 	} else {
@@ -613,7 +585,7 @@ static void close_connection(connection_list_element *connection, const char *me
 
 static void calculate_nopaid_shares(struct connection_pool_data *conn_data, struct xdag_pool_task *task, xdag_hash_t hash)
 {
-	const xtime_t task_time = task->task_time;
+	const xdag_time_t task_time = task->task_time;
 
 	if(conn_data->task_time <= task_time) { // At the beginning conn_data->task_time=0. conn_data->task_time > task_time isn't accepted.
 		double diff = ((uint64_t*)hash)[2];
@@ -681,11 +653,11 @@ static int register_new_miner(connection_list_element *connection)
 	miner_list_element *elt;
 	struct connection_pool_data *conn_data = &connection->connection_data;
 
-	xtime_t tm;
+	xdag_time_t tm;
 	const int64_t position = xdag_get_block_pos((const uint64_t*)conn_data->data, &tm, 0);
 	if(position < 0) {
-		char address_buf[33] = {0};
-		char message[100] = {0};
+		char address_buf[33];
+		char message[100];
 		xdag_hash2address((const uint64_t*)conn_data->data, address_buf);
 		sprintf(message, "Miner's address is unknown (%s)", address_buf);
 		close_connection(connection, message);
@@ -794,7 +766,7 @@ static int is_block_data_received(connection_list_element *connection)
 
 			if(crc == crc_of_array((uint8_t*)conn_data->block, sizeof(struct xdag_block))) {
 				conn_data->block->field[0].transport_header = 0;
-				block_queue_append_new(conn_data->block);
+				xdag_append_new_block(conn_data->block);
 			} else {
 				free(conn_data->block);
 			}
@@ -885,16 +857,13 @@ static int receive_data_from_connection(connection_list_element *connection)
 #endif
 
 	struct connection_pool_data *conn_data = &connection->connection_data;
-	ssize_t data_size = sizeof(struct xdag_field) - conn_data->data_size;
+	size_t data_size = sizeof(struct xdag_field) - conn_data->data_size;
 	data_size = read(conn_data->connection_descriptor.fd, (uint8_t*)conn_data->data + conn_data->data_size, data_size);
 
-	if(data_size < 0) {
-		char message[100] = {0};
+	if(data_size <= 0) {
+		char message[100];
 		sprintf(message, "read error : %s", strerror(errno));
 		close_connection(connection, message);
-		return 0;
-	} else if(data_size == 0) {
-		// fixme: read 0
 		return 0;
 	}
 
@@ -929,7 +898,6 @@ static int receive_data_from_connection(connection_list_element *connection)
 static int send_data_to_connection(connection_list_element *connection, int *processed)
 {
 	struct xdag_field data[2];
-	memset(data, 0, sizeof(struct xdag_field) * 2);
 	int fields_count = 0;
 	struct connection_pool_data *conn_data = &connection->connection_data;
 
@@ -959,7 +927,7 @@ static int send_data_to_connection(connection_list_element *connection, int *pro
 		size_t length = write(conn_data->connection_descriptor.fd, (void*)data, fields_count * sizeof(struct xdag_field));
 
 		if(length != fields_count * sizeof(struct xdag_field)) {
-			char message[100] = {0};
+			char message[100];
 			sprintf(message, "write error  %s : write %zu bytes of %lu bytes", strerror(errno), length, fields_count * sizeof(struct xdag_field));
 			close_connection(connection, message);
 			return 0;
@@ -1009,7 +977,7 @@ void *pool_main_thread(void *arg)
 		{
 			struct pollfd *p = g_fds + index++;
 
-			if(atomic_load_explicit_int(&elt->connection_data.deleted, memory_order_acquire)) {
+			if(elt->connection_data.deleted) {
 				close_connection(elt, elt->connection_data.disconnection_reason);
 				continue;
 			}
@@ -1054,35 +1022,9 @@ void *pool_main_thread(void *arg)
 
 void *pool_block_thread(void *arg)
 {
-	while(!g_xdag_sync_on) {
-		sleep(1);
-	}
-
-	for(;;) {
-		int processed = 0;
-
-		struct xdag_block *b = block_queue_first();
-
-		if(b) {
-			processed = 1;
-			b->field[0].transport_header = 2;
-
-			int res = xdag_add_block(b);
-			if(res > 0) {
-				xdag_send_new_block(b);
-			}
-			free(b);
-		}
-
-		if(!processed) sleep(1);
-	}
-
-	return 0;
-}
-
-void *pool_payment_thread(void *arg)
-{
-	xtime_t prev_task_time = 0;
+	xdag_time_t prev_task_time = 0;
+	struct xdag_block *b;
+	int res;
 
 	while(!g_xdag_sync_on) {
 		sleep(1);
@@ -1092,7 +1034,7 @@ void *pool_payment_thread(void *arg)
 		int processed = 0;
 		const uint64_t task_index = g_xdag_pool_task_index;
 		struct xdag_pool_task *task = &g_xdag_pool_task[task_index & 1];
-		const xtime_t current_task_time = task->task_time;
+		const xdag_time_t current_task_time = task->task_time;
 
 		if(current_task_time > prev_task_time) {
 			uint64_t *hash = g_xdag_mined_hashes[(current_task_time - CONFIRMATIONS_COUNT + 1) & (CONFIRMATIONS_COUNT - 1)];
@@ -1100,11 +1042,24 @@ void *pool_payment_thread(void *arg)
 			processed = 1;
 			prev_task_time = current_task_time;
 
-			int res = pay_miners(current_task_time - CONFIRMATIONS_COUNT + 1);
+			res = pay_miners(current_task_time - CONFIRMATIONS_COUNT + 1);
 			remove_inactive_miners();
 
 			xdag_info("%s: %016llx%016llx%016llx%016llx t=%llx res=%d", (res ? "Nopaid" : "Paid  "),
 				hash[3], hash[2], hash[1], hash[0], (current_task_time - CONFIRMATIONS_COUNT + 1) << 16 | 0xffff, res);
+		}
+
+		b = xdag_first_new_block();
+
+		if(b) {
+			processed = 1;
+			b->field[0].transport_header = 2;
+
+			res = xdag_add_block(b);
+			if(res > 0) {
+				xdag_send_new_block(b);
+			}
+			free(b);
 		}
 
 		if(!processed) sleep(1);
@@ -1187,7 +1142,7 @@ static double countpay(struct miner_pool_data *miner, int confirmation_index, do
 	return diff2pay(sum, diff_count);
 }
 
-static double precalculate_payments(uint64_t *hash, int confirmation_index, struct payment_data *data, double *diff, double *prev_diff, uint64_t *nonce)
+static int precalculate_payments(uint64_t *hash, int confirmation_index, struct payment_data *data, double *diff, double *prev_diff, uint64_t *nonce)
 {
 	miner_list_element *elt;
 
@@ -1196,7 +1151,7 @@ static double precalculate_payments(uint64_t *hash, int confirmation_index, stru
 
 	if(g_pool_fund) {
 		if(g_fund_miner.state == MINER_UNKNOWN) {
-			xtime_t t;
+			xdag_time_t t;
 			if(!xdag_address2hash(FUND_ADDRESS, g_fund_miner.id.hash) && xdag_get_block_pos(g_fund_miner.id.hash, &t, 0) >= 0) {
 				g_fund_miner.state = MINER_SERVICE;
 			}
@@ -1260,9 +1215,7 @@ static void transfer_payment(struct miner_pool_data *miner, xdag_amount_t paymen
 	xdag_log_xfer(fields[0].data, fields[*field_index].data, payment_sum);
 
 	if(++*field_index == payments_per_block) {
-		struct xdag_block *payment_block = xdag_create_block(fields, 1, *field_index - 1, 0, 0, 0, NULL);
-		block_queue_append_new(payment_block);
-
+		xdag_create_block(fields, 1, *field_index - 1, 0, 0, 0, NULL);
 		*field_index = 1;
 		fields[0].amount = 0;
 	}
@@ -1306,12 +1259,11 @@ static void do_payments(uint64_t *hash, int payments_per_block, struct payment_d
 	}
 
 	if(field_index > 1) {
-		struct xdag_block *payment_block = xdag_create_block(fields, 1, field_index - 1, 0, 0, 0, NULL);
-		block_queue_append_new(payment_block);
+		xdag_create_block(fields, 1, field_index - 1, 0, 0, 0, NULL);
 	}
 }
 
-int pay_miners(xtime_t time)
+int pay_miners(xdag_time_t time)
 {
 	int defkey;
 	struct payment_data data;
@@ -1356,10 +1308,9 @@ int pay_miners(xtime_t time)
 
 	double *diff = malloc(2 * miners_count * sizeof(double));
 	if(!diff) return -8;
-
 	double *prev_diff = diff + miners_count;
-	double prev_sum = precalculate_payments(hash, confirmation_index, &data, diff, prev_diff, nonce);
-	if(prev_sum <= DBL_EPSILON) {
+
+	if(!precalculate_payments(hash, confirmation_index, &data, diff, prev_diff, nonce)) {
 		free(diff);
 		return -9;
 	}
@@ -1374,7 +1325,7 @@ int pay_miners(xtime_t time)
 void remove_inactive_miners(void)
 {
 	miner_list_element *elt, *eltmp;
-	char address[33] = {0};
+	char address[33];
 
 	pthread_mutex_lock(&g_connections_mutex);
 	LL_FOREACH_SAFE(g_miner_list_head, elt, eltmp)
@@ -1418,12 +1369,12 @@ static const char* connection_state_to_string(int connection_state)
 
 static int print_miner(FILE *out, int index, struct miner_pool_data *miner, int print_connections)
 {
-	char ip_port_str[32] = {0}, in_out_str[64] = {0};
-	char address_buf[33] = {0};
+	char ip_port_str[32], in_out_str[64];
+	char address_buf[33];
 	xdag_hash2address(miner->id.data, address_buf);
 
 	fprintf(out, "%3d. %s  %s  %-21s  %-16s  %-13lf  -             %Lf\n", index, address_buf,
-		miner_state_to_string(miner->state), "-", "-", miner_calculate_unpaid_shares(miner), xdag_log_difficulty2hashrate(miner->mean_log_difficulty));
+		miner_state_to_string(miner->state), "-", "-", miner_calculate_unpaid_shares(miner), log_difficulty2hashrate(miner->mean_log_difficulty));
 
 	if(print_connections) {
 		connection_list_element *elt;
@@ -1440,7 +1391,7 @@ static int print_miner(FILE *out, int index, struct miner_pool_data *miner, int 
 				//TODO: fix that logic
 				fprintf(out, " C%d. -                                 -        %-21s  %-16s  %-13lf  %-12s  %Lf\n", ++conn_index,
 					ip_port_str, in_out_str, connection_calculate_unpaid_shares(conn_data),
-					conn_data->worker_name ? conn_data->worker_name : "-", xdag_log_difficulty2hashrate(conn_data->mean_log_difficulty));
+					conn_data->worker_name ? conn_data->worker_name : "-", log_difficulty2hashrate(conn_data->mean_log_difficulty));
 			}
 		}
 	}
@@ -1467,8 +1418,8 @@ static int print_miners(FILE *out)
 
 static void print_connection(FILE *out, int index, struct connection_pool_data *conn_data)
 {
-	char ip_port_str[32] = {0}, in_out_str[64] = {0};
-	char address[50] = {0};
+	char ip_port_str[32], in_out_str[64];
+	char address[50];
 	int ip = conn_data->ip;
 	sprintf(ip_port_str, "%u.%u.%u.%u:%u", ip & 0xff, ip >> 8 & 0xff, ip >> 16 & 0xff, ip >> 24 & 0xff, ntohs(conn_data->port));
 	sprintf(in_out_str, "%llu/%llu", (unsigned long long)conn_data->nfield_in * sizeof(struct xdag_field),
@@ -1477,13 +1428,13 @@ static void print_connection(FILE *out, int index, struct connection_pool_data *
 	if(conn_data->miner) {
 		xdag_hash2address(conn_data->miner->id.data, address);
 	} else {
-		strncpy(address, "-                               ", 49);
+		strcpy(address, "-                               ");
 	}
 
 	//TODO: fix that logic
 	fprintf(out, "%3d. %s  %s  %-21s  %-16s  %-13lf  %-12s  %Lf\n", index, address,
 		connection_state_to_string(conn_data->state), ip_port_str, in_out_str, connection_calculate_unpaid_shares(conn_data),
-		conn_data->worker_name ? conn_data->worker_name : "-", xdag_log_difficulty2hashrate(conn_data->mean_log_difficulty));
+		conn_data->worker_name ? conn_data->worker_name : "-", log_difficulty2hashrate(conn_data->mean_log_difficulty));
 }
 
 static int print_connections(FILE *out)
@@ -1536,17 +1487,17 @@ void disconnect_connections(enum disconnect_type type, char *value)
 	LL_FOREACH(g_connection_list_head, elt)
 	{
 		if(type == DISCONNECT_ALL) {
+			elt->connection_data.deleted = 1;
 			elt->connection_data.disconnection_reason = "disconnected manually";
-			atomic_store_explicit_int(&elt->connection_data.deleted, 1, memory_order_release);
 		} else if(type == DISCONNECT_BY_ADRESS) {
 			if(memcmp(elt->connection_data.data, hash, sizeof(xdag_hashlow_t)) == 0) {
+				elt->connection_data.deleted = 1;
 				elt->connection_data.disconnection_reason = "disconnected manually";
-				atomic_store_explicit_int(&elt->connection_data.deleted, 1, memory_order_release);
 			}
 		} else if(type == DISCONNECT_BY_IP) {
 			if(elt->connection_data.ip == ip) {
+				elt->connection_data.deleted = 1;
 				elt->connection_data.disconnection_reason = "disconnected manually";
-				atomic_store_explicit_int(&elt->connection_data.deleted, 1, memory_order_release);
 			}
 		}
 	}
@@ -1564,8 +1515,8 @@ void* pool_remove_inactive_connections(void* arg)
 		LL_FOREACH(g_connection_list_head, elt)
 		{
 			if(current_time - elt->connection_data.last_share_time > 300) { //last share is received more than 5 minutes ago
+				elt->connection_data.deleted = 1;
 				elt->connection_data.disconnection_reason = "inactive connection";
-				atomic_store_explicit_int(&elt->connection_data.deleted, 1, memory_order_release);
 			}
 		}
 		pthread_mutex_unlock(&g_connections_mutex);
@@ -1576,8 +1527,7 @@ void* pool_remove_inactive_connections(void* arg)
 	return NULL;
 }
 
-/* append new generated block and new blocks received from miner to list */
-void block_queue_append_new(struct xdag_block *b)
+void xdag_append_new_block(struct xdag_block *b)
 {
 	if(!b) return;
 
@@ -1593,8 +1543,7 @@ void block_queue_append_new(struct xdag_block *b)
 	pthread_mutex_unlock(&g_pool_mutex);
 }
 
-/* get the first new block in list */
-struct xdag_block *block_queue_first(void)
+struct xdag_block * xdag_first_new_block(void)
 {
 	struct xdag_block *b = 0;
 	pthread_mutex_lock(&g_pool_mutex);
@@ -1614,12 +1563,12 @@ struct xdag_block *block_queue_first(void)
 
 void update_mean_log_diff(struct connection_pool_data *conn_data, struct xdag_pool_task *task, xdag_hash_t hash)
 {
-	const xtime_t task_time = task->task_time;
+	const xdag_time_t task_time = task->task_time;
 
 	if(conn_data->task_time < task_time) {
 		if(conn_data->task_time != 0) {
 			conn_data->mean_log_difficulty =
-				moving_average(conn_data->mean_log_difficulty, xdag_diff2log(xdag_hash_difficulty(conn_data->last_min_hash)), conn_data->bounded_task_counter);
+				moving_average(conn_data->mean_log_difficulty, diff2log(xdag_hash_difficulty(conn_data->last_min_hash)), conn_data->bounded_task_counter);
 			if(conn_data->bounded_task_counter < NSAMPLES_MAX) {
 				++conn_data->bounded_task_counter;
 			}
@@ -1632,7 +1581,7 @@ void update_mean_log_diff(struct connection_pool_data *conn_data, struct xdag_po
 	if(conn_data->miner->task_time < task_time) {
 		if(conn_data->miner->task_time != 0) {
 			conn_data->miner->mean_log_difficulty =
-				moving_average(conn_data->miner->mean_log_difficulty, xdag_diff2log(xdag_hash_difficulty(conn_data->miner->last_min_hash)), conn_data->miner->bounded_task_counter);
+				moving_average(conn_data->miner->mean_log_difficulty, diff2log(xdag_hash_difficulty(conn_data->miner->last_min_hash)), conn_data->miner->bounded_task_counter);
 			if(conn_data->miner->bounded_task_counter < NSAMPLES_MAX) {
 				++conn_data->miner->bounded_task_counter;
 			}
@@ -1643,9 +1592,20 @@ void update_mean_log_diff(struct connection_pool_data *conn_data, struct xdag_po
 	}
 }
 
+long double diff2log(xdag_diff_t diff)
+{
+	long double res = (long double)xdag_diff_to64(diff);
+	xdag_diff_shr32(&diff);
+	xdag_diff_shr32(&diff);
+	if(xdag_diff_to64(diff)) {
+		res += ldexpl((long double)xdag_diff_to64(diff), 64);
+	}
+	return (res > 0 ? logl(res) : 0);
+}
+
 static void miner_print_time_intervals(struct miner_pool_data *miner, int current_interval_index, xdag_time_t current_task_time, FILE *out)
 {
-	char time_buf[60] = {0};
+	char time_buf[60];
 
 	fprintf(out, "----------------------------------------------------------------------\n");
 	fprintf(out, "current  index  start time                difficulty  reward for block\n");
@@ -1656,13 +1616,13 @@ static void miner_print_time_intervals(struct miner_pool_data *miner, int curren
 		int is_reward = memcmp(g_xdag_mined_nonce[i], miner->id.data, sizeof(xdag_hashlow_t)) == 0;
 
 		// here we calculate time offset for interval of time
-		xtime_t task_time = current_task_time << 16 | 0xffff;
+		xdag_time_t task_time = current_task_time << 16 | 0xffff;
 		if(i < current_interval_index) {
 			task_time = task_time - (2 << 15) * (current_interval_index - i);	// 2 << 15 - 64 seconds
 		} else if(i > current_interval_index) {
 			task_time = task_time - (2 << 15) * (current_interval_index + CONFIRMATIONS_COUNT - i);
 		}
-		xdag_xtime_to_string(task_time, time_buf);
+		xdag_time_to_string(task_time, time_buf);
 
 		fprintf(out, "      %s  %2d     %s  %10lf         %s\n",
 			i == current_interval_index ? ">" : " ", i + 1, time_buf, miner->maxdiff[i], is_reward ? "+" : " ");
@@ -1683,8 +1643,8 @@ static void connection_print_time_intervals(struct connection_pool_data *conn_da
 
 static void print_connection_stats(struct connection_pool_data *conn_data, int connection_index, int current_interval_index, FILE *out)
 {
-	char time_buf[50] = {0};
-	xdag_time_to_string(conn_data->connected_time, time_buf);
+	char time_buf[50];
+	time_to_string(conn_data->connected_time, time_buf);
 	int ip = conn_data->ip;
 
 	fprintf(out, "\nConnection %d\n", connection_index);
@@ -1696,7 +1656,7 @@ static void print_connection_stats(struct connection_pool_data *conn_data, int c
 		fprintf(out, "Worker name: %s\n", conn_data->worker_name);
 	}
 	fprintf(out, "Unpaid shares rate: %lf\n", connection_calculate_unpaid_shares(conn_data));
-	fprintf(out, "Approximate hashrate: %Lf\n", xdag_log_difficulty2hashrate(conn_data->mean_log_difficulty));
+	fprintf(out, "Approximate hashrate: %Lf\n", log_difficulty2hashrate(conn_data->mean_log_difficulty));
 	if(conn_data->prev_diff_count > 0) {
 		fprintf(out, "Outdated shares (indirect contribution):\n");
 		fprintf(out, "Summ of difficulties: %lf\n", conn_data->prev_diff);
@@ -1715,12 +1675,12 @@ static void print_connection_stats(struct connection_pool_data *conn_data, int c
 
 static void print_miner_stats(struct miner_pool_data *miner, FILE *out)
 {
-	char time_buf[50] = {0};
-	xdag_time_to_string(miner->registered_time, time_buf);
+	char time_buf[50];
+	time_to_string(miner->registered_time, time_buf);
 
 	const uint64_t task_index = g_xdag_pool_task_index;
 	struct xdag_pool_task *task = &g_xdag_pool_task[task_index & 1];
-	const xtime_t current_task_time = task->task_time;
+	const xdag_time_t current_task_time = task->task_time;
 	const int current_interval_index = current_task_time & (CONFIRMATIONS_COUNT - 1);
 
 	uint64_t *h = miner->id.data;
@@ -1729,7 +1689,7 @@ static void print_miner_stats(struct miner_pool_data *miner, FILE *out)
 	fprintf(out, "Registered at: %s\n", time_buf);
 	fprintf(out, "State: %s\n", miner_state_to_string(miner->state));
 	fprintf(out, "Unpaid shares rate: %lf\n", miner_calculate_unpaid_shares(miner));
-	fprintf(out, "Approximate hashrate: %Lf\n", xdag_log_difficulty2hashrate(miner->mean_log_difficulty));
+	fprintf(out, "Approximate hashrate: %Lf\n", log_difficulty2hashrate(miner->mean_log_difficulty));
 	if(miner->prev_diff_count > 0) {
 		fprintf(out, "Outdated shares (indirect contribution):\n");
 		fprintf(out, "Summ of difficulties: %lf\n", miner->prev_diff);

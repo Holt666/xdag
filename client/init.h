@@ -1,10 +1,9 @@
-/* basic variables, T13.714-T14.582 $DVS:time$ */
+/* basic variables, T13.714-T14.297 $DVS:time$ */
 
 #ifndef XDAG_MAIN_H
 #define XDAG_MAIN_H
 
 #include <time.h>
-#include "time.h"
 #include "block.h"
 #include "system.h"
 
@@ -15,23 +14,24 @@ enum xdag_states
 #undef xdag_state
 };
 
+/* the maximum period of time for which blocks are requested, not their amounts */
+#define REQUEST_BLOCKS_MAX_TIME	(1 << 20)
+
 extern struct xdag_stats
 {
-	xdag_diff_t difficulty, max_difficulty;
-	uint64_t nblocks, total_nblocks;
-	uint64_t nmain, total_nmain;
-	uint32_t nhosts, total_nhosts;
-	union {
-		uint32_t reserved[2];
-		xdag_frame_t main_time;
-	};
+    xdag_diff_t difficulty, max_difficulty;
+    uint64_t nblocks, total_nblocks;
+    uint64_t nmain, total_nmain;
+    uint32_t nhosts, total_nhosts, reserved1, reserved2;
 } g_xdag_stats;
+
+#define HASHRATE_LAST_MAX_TIME	(64 * 4) // numbers of main blocks in about 4H, to calculate the pool and network mean hashrate
 
 extern struct xdag_ext_stats
 {
 	xdag_diff_t hashrate_total[HASHRATE_LAST_MAX_TIME];
 	xdag_diff_t hashrate_ours[HASHRATE_LAST_MAX_TIME];
-	xtime_t hashrate_last_time;
+	xdag_time_t hashrate_last_time;
 	uint64_t nnoref;
 	uint64_t nextra;
 	uint64_t nhashes;
@@ -78,5 +78,8 @@ extern int(*g_xdag_show_state)(const char *state, const char *balance, const cha
 #ifdef __cplusplus
 };
 #endif
+
+#define xdag_amount2xdag(amount) ((unsigned)((amount) >> 32))
+#define xdag_amount2cheato(amount) ((unsigned)(((uint64_t)(unsigned)(amount) * 1000000000) >> 32))
 
 #endif

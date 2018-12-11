@@ -14,7 +14,6 @@
 
 #include "../system.h"
 #include "../utils/log.h"
-#include "../uthash/utlist.h"
 #include "rpc_procedures.h"
 
 /*
@@ -33,17 +32,11 @@
 #define RPC_PARSE_ERROR -32700
 #define RPC_INVALID_REQUEST -32600
 #define RPC_METHOD_NOT_FOUND -32601
-#define RPC_INVALID_PARAMS -32602
-#define RPC_INTERNAL_ERROR -32603
+#define RPC_INVALID_PARAMS -32603
+#define RPC_INTERNAL_ERROR -32693
 
-#define RPC_SERVER_NOT_ALLOW -32000
-#define RPC_SERVER_MAX_CONNECTION -32001
-
-struct rpc_procedure_element {
-	struct xdag_rpc_procedure procedure;
-	struct rpc_procedure_element *next;
-};
-struct rpc_procedure_element *g_procedures = NULL;
+static struct xdag_rpc_procedure *g_procedures;
+static int g_procedure_count = 0;
 
 /* invoke procedure */
 cJSON * invoke_procedure(char *name, cJSON *params, cJSON *id, char *version);
@@ -103,69 +96,57 @@ static void xdag_rpc_service_procedure_destroy(struct xdag_rpc_procedure *proced
 
 int xdag_rpc_service_register_procedure(xdag_rpc_function function_pointer, char *name, void * data)
 {
-	struct rpc_procedure_element *elem;
-	LL_FOREACH(g_procedures, elem)
-	{
-		if(!strcmp(elem->procedure.name, name)) {
-			xdag_err("rpc server : procedure %s already existed.", name);
+	int i = g_procedure_count++;
+	if(!g_procedures) {
+		g_procedures = malloc(sizeof(struct xdag_rpc_procedure));
+	} else {
+		struct xdag_rpc_procedure * ptr = realloc(g_procedures, sizeof(struct xdag_rpc_procedure) * g_procedure_count);
+		if(!ptr) {
+			xdag_err("rpc server : realloc failed!");
 			return -1;
 		}
+		g_procedures = ptr;
 	}
-
-	struct rpc_procedure_element *new_elem = malloc(sizeof(struct rpc_procedure_element));
-	if(!new_elem) {
-		xdag_err("rpc server : malloc failed!");
+	
+	if((g_procedures[i].name = strdup(name)) == NULL) {
 		return -1;
 	}
-	memset(new_elem, 0, sizeof(struct rpc_procedure_element));
-	new_elem->procedure.name = strdup(name);
-	new_elem->procedure.function = function_pointer;
-	new_elem->procedure.data = data;
-	LL_APPEND(g_procedures, new_elem);
+	
+	g_procedures[i].function = function_pointer;
+	g_procedures[i].data = data;
 	return 0;
 }
 
 int xdag_rpc_service_unregister_procedure(char *name)
 {
-	struct rpc_procedure_element *elem, *tmp;
-	int found = 0;
-	LL_FOREACH_SAFE(g_procedures, elem, tmp)
-	{
-		if(!strcmp(name, elem->procedure.name)) {
-			xdag_rpc_service_procedure_destroy(&(elem->procedure));
-			LL_DELETE(g_procedures, elem);
-			free(elem);
-			found = 1;
+	int i, found = 0;
+	if(g_procedures){
+		for (i = 0; i < g_procedure_count; i++){
+			if(found) {
+				g_procedures[i-1] = g_procedures[i];
+			} else if(!strcmp(name, g_procedures[i].name)){
+				found = 1;
+				xdag_rpc_service_procedure_destroy(&(g_procedures[i]));
+			}
 		}
-	}
-
-	if(!found) {
+		if(found){
+			g_procedure_count--;
+			if(g_procedure_count){
+				struct xdag_rpc_procedure * ptr = realloc(g_procedures, sizeof(struct xdag_rpc_procedure) * g_procedure_count);
+				if(!ptr){
+					xdag_err("rpc server : realloc failed!");
+					return -1;
+				}
+				g_procedures = ptr;
+			}else{
+				g_procedures = NULL;
+			}
+		} else {
+			xdag_err("rpc server : procedure '%s' not found\n", name);
+		}
+	} else {
 		xdag_err("rpc server : procedure '%s' not found\n", name);
-	}
-	return 0;
-}
-
-int xdag_rpc_service_list_procedures(char *result)
-{
-	char name[64] = {0};
-	struct rpc_procedure_element *elem;
-	LL_FOREACH(g_procedures, elem)
-	{
-		memset(name, 0, 64);
-		sprintf(name, "%s\n", elem->procedure.name);
-		strcat(result, name);
-	}
-	return 0;
-}
-
-int xdag_rpc_service_clear_procedures(void)
-{
-	struct rpc_procedure_element *elem, *tmp;
-	LL_FOREACH_SAFE(g_procedures, elem, tmp)
-	{
-		xdag_rpc_service_procedure_destroy(&(elem->procedure));
-		LL_DELETE(g_procedures, elem);
-		free(elem);
+		return -1;
 	}
 	return 0;
 }
@@ -175,37 +156,30 @@ cJSON * invoke_procedure(char *name, cJSON *params, cJSON *id, char *version)
 	cJSON *returned = NULL;
 	int procedure_found = 0;
 	struct xdag_rpc_context ctx;
-	memset(&ctx, 0, sizeof(struct xdag_rpc_context));
-
-	struct rpc_procedure_element *elem;
-	LL_FOREACH(g_procedures, elem)
-	{
-		if(!strcmp(name, elem->procedure.name)) {
-			ctx.data = elem->procedure.data;
-			returned = elem->procedure.function(&ctx, params, id, version);
+	ctx.error_code = 0;
+	ctx.error_message = NULL;
+	int i = g_procedure_count;
+	while (i--) {
+		if(!strcmp(g_procedures[i].name, name)) {
 			procedure_found = 1;
+			ctx.data = g_procedures[i].data;
+			returned = g_procedures[i].function(&ctx, params, id, version);
 			break;
 		}
 	}
-
+	
 	if(!procedure_found) {
-		ctx.error_code = RPC_METHOD_NOT_FOUND;
-		ctx.error_message = strdup("Method not found.");
-	}
-
-	if(ctx.error_code || ctx.error_message) {
-		if(returned) {
-			cJSON_Delete(returned);
-		}
-		returned = make_error(ctx.error_code, ctx.error_message, id, version);
-		if (ctx.error_message) {
-			free(ctx.error_message);
-		}
+		return make_error(RPC_METHOD_NOT_FOUND, strdup("Method not found."), id, version);
 	} else {
-		returned = make_result(returned, id, version);
+		if(ctx.error_code) {
+			if(returned) {
+				cJSON_Delete(returned);
+			}
+			return make_error(ctx.error_code, ctx.error_message, id, version);
+		} else {
+			return make_result(returned, id, version);
+		}
 	}
-
-	return returned;
 }
 
 /* handle rpc request */
@@ -253,10 +227,10 @@ cJSON * xdag_rpc_handle_request(char* buffer)
 		}
 		
 		if(!result) {
-			result = make_error(RPC_PARSE_ERROR, "Request parse error.", 0, "2.0");
+			result = make_error(RPC_PARSE_ERROR, strdup("Request parse error."), 0, "2.0");
 		}
 	} else {
-		result = make_error( RPC_PARSE_ERROR, "Request parse error.", 0, "2.0");
+		result = make_error( RPC_PARSE_ERROR, strdup("Request parse error."), 0, "2.0");
 	}
 	
 	if(root) {

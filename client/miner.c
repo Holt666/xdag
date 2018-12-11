@@ -147,7 +147,7 @@ void *miner_net_thread(void *arg)
 	const char *pool_address = (const char*)arg;
 	const char *mess = NULL;
 	int res = 0;
-	xtime_t t;
+	xdag_time_t t;
 	struct miner *m = &g_local_miner;
 
 	while(!g_xdag_sync_on) {
@@ -248,7 +248,9 @@ begin:
 				if(!memcmp(last->data, hash, sizeof(xdag_hashlow_t))) {
 					xdag_set_balance(hash, last->amount);
 
-					atomic_store_explicit_uint_least64(&g_xdag_last_received, current_time, memory_order_relaxed);
+					pthread_mutex_lock(&g_transport_mutex);
+					g_xdag_last_received = current_time;
+					pthread_mutex_unlock(&g_transport_mutex);
 
 					ndata = 0;
 
@@ -257,7 +259,7 @@ begin:
 					const uint64_t task_index = g_xdag_pool_task_index + 1;
 					struct xdag_pool_task *task = &g_xdag_pool_task[task_index & 1];
 
-					task->task_time = xdag_get_frame();
+					task->task_time = xdag_main_time();
 					xdag_hash_set_state(task->ctx, data[0].data,
 						sizeof(struct xdag_block) - 2 * sizeof(struct xdag_field));
 					xdag_hash_update(task->ctx, data[1].data, sizeof(struct xdag_field));
@@ -409,7 +411,7 @@ int xdag_send_block_via_pool(struct xdag_block *b)
 /* picks random pool from the list of pools */
 int xdag_pick_pool(char *pool_address)
 {
-	char addresses[30][50] = {0};
+	char addresses[30][50];
 	const char *error_message;
 	srand(time(NULL));
 	
@@ -432,7 +434,7 @@ int xdag_pick_pool(char *pool_address)
 		int socket = xdag_connect_pool(addresses[index], &error_message);
 		if(socket != INVALID_SOCKET) {
 			xdag_connection_close(socket);
-			strncpy(pool_address, addresses[index], 49);
+			strcpy(pool_address, addresses[index]);
 			return 1;
 		} else {
 			++index;
