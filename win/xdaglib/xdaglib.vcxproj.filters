@@ -165,6 +165,18 @@
     <ClCompile Include="..\..\dnet\dnet_xdag.c">
       <Filter>dnet</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\client\time.c">
+      <Filter>client</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\client\math.c">
+      <Filter>client</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\client\utils\atomic.c">
+      <Filter>client\utils</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\client\json-rpc\rpc_commands.c">
+      <Filter>client\json-rpc</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\client\address.h">
@@ -338,6 +350,18 @@
     </ClInclude>
     <ClInclude Include="..\..\dnet\dnet_packet.h">
       <Filter>dnet</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\client\time.h">
+      <Filter>client</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\client\math.h">
+      <Filter>client</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\client\utils\atomic.h">
+      <Filter>client\utils</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\client\json-rpc\rpc_commands.h">
+      <Filter>client\json-rpc</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
