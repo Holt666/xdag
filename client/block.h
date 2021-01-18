@@ -112,7 +112,7 @@ struct block_internal {
     xdag_hashlow_t link[MAX_LINKS];
     uint64_t height;
     uint16_t flags, in_mask, n_our_key;
-    uint8_t nlinks:4, max_diff_link:4, reserved;
+    uint8_t nlinks:4, max_diff_link:4;
 };
 
 #ifdef __cplusplus

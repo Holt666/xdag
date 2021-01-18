@@ -63,6 +63,7 @@ void processNetCommand(char *nextParam, FILE *out);
 void processTransportCommand(char *nextParam, FILE *out);
 void processPoolCommand(char *nextParam, FILE *out);
 void processStatsCommand(FILE *out);
+void processRocksdbCommand(char *nextParam, FILE *out);
 //void processInternalStatsCommand(FILE *out);
 void processExitCommand(void);
 void processXferCommand(char *nextParam, FILE *out, int ispwd, uint32_t* pwd);
@@ -95,6 +96,7 @@ int xdag_com_net(char *, FILE*);
 int xdag_com_transport(char *, FILE*);
 int xdag_com_pool(char *, FILE*);
 int xdag_com_stats(char *, FILE*);
+int xdag_com_rocksdb(char *, FILE*);
 int xdag_com_state(char *, FILE*);
 int xdag_com_internal_stats(char *, FILE*);
 int xdag_com_help(char *, FILE*);
@@ -130,6 +132,7 @@ XDAG_COMMAND commands[] = {
 	{ "run"         , 0, xdag_com_run },
 	{ "state"       , 0, xdag_com_state },
 	{ "stats"       , 0, xdag_com_stats },
+    { "rocksdb"     , 0, xdag_com_rocksdb },
 //	{ "internals"   , 2, xdag_com_internal_stats },
 	{ "terminate"   , 0, xdag_com_terminate },
 	{ "exit"        , 0, xdag_com_exit },
@@ -249,6 +252,12 @@ int xdag_com_stats(char * args, FILE* out)
 {
 	processStatsCommand(out);
 	return 0;
+}
+
+int xdag_com_rocksdb(char * args, FILE* out)
+{
+    processRocksdbCommand(args, out);
+    return 0;
 }
 
 int xdag_com_state(char * args, FILE* out)
@@ -610,6 +619,12 @@ void processStatsCommand(FILE *out)
 			xdag_hashrate(g_xdag_extstats.hashrate_ours), xdag_hashrate(g_xdag_extstats.hashrate_total)
 		);
 	}
+}
+
+void processRocksdbCommand(char *nextParam, FILE *out)
+{
+    char *msg = rocksdb_options_statistics_get_string(g_xdag_rsdb->options);
+    fprintf(out, "%s", msg);
 }
 
 //void processInternalStatsCommand(FILE *out)
@@ -1047,6 +1062,7 @@ void processHelpCommand(FILE *out)
 		"  rpc [command]        - rpc commands, try 'rpc help'\n"
 		"  mainblocks [N]       - print list of N (20 by default) main blocks\n"
 		"  minedblocks [N]      - print list of N (20 by default) main blocks mined by current pool\n"
+        "  rocksdb              - print rocksdb statistics\n"
 		"  version              - print version information.\n"
 		, g_coinname);
 }

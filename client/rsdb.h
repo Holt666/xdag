@@ -16,8 +16,8 @@
 typedef struct rocksdb_column_family_handle_t* xd_rsdb_column_handle;
 
 typedef struct xd_rsdb_column_familys {
-    const char *colum_name[RSDB_MAX_COLUMN];
-    const rocksdb_options_t *column_option[RSDB_MAX_COLUMN];
+    char *colum_name[RSDB_MAX_COLUMN];
+    rocksdb_options_t *column_option[RSDB_MAX_COLUMN];
     xd_rsdb_column_handle column_handle[RSDB_MAX_COLUMN];
 } xd_rsdb_cf_t;
 

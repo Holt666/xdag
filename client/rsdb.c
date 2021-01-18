@@ -152,12 +152,7 @@ static rocksdb_options_t* get_db_options()
     rocksdb_options_t* options = rocksdb_options_create();
     rocksdb_options_set_create_if_missing(options, 1);
     rocksdb_options_set_create_missing_column_families(options, 1);
-    rocksdb_options_set_memtable_whole_key_filtering(options, 1);
-    rocksdb_options_set_max_total_wal_size(options, 1 * 1024 * 1024 * 1024LL);
-    rocksdb_options_increase_parallelism(options, 4);
-    rocksdb_options_set_enable_pipelined_write(options, 1);
-    rocksdb_options_set_max_file_opening_threads(options, -1);
-    rocksdb_options_set_max_manifest_file_size(options, 100 * 1024 * 1024ULL);
+    rocksdb_options_set_max_open_files(options, -1);
     return options;
 }
 
@@ -179,6 +174,7 @@ static int xd_rsdb_base_memtable_size_bytes()
 static rocksdb_options_t* get_base_cf_options(rocksdb_block_based_table_options_t* table_options, unsigned long long memtable_size_bytes)
 {
     rocksdb_options_t* cf_options = rocksdb_options_create();
+    rocksdb_options_set_max_open_files(cf_options, -1);
     rocksdb_options_set_block_based_table_factory(cf_options, table_options);
     rocksdb_options_set_write_buffer_size(cf_options, 67108864);// 64MB
     rocksdb_options_set_max_write_buffer_number(cf_options, 3);
@@ -214,13 +210,13 @@ static rocksdb_options_t* get_small_cf_options(rocksdb_block_based_table_options
     return cf_options;
 }
 
-static const struct rocksdb_options_t* get_cf_options(const char* cf_name)
+static rocksdb_options_t* get_cf_options(char* cf_name)
 {
     rocksdb_options_t* cf_options = NULL;
     int memtable_size_bytes = xd_rsdb_base_memtable_size_bytes();
     if (strncmp("SETTING", cf_name, strlen("SETTING")) == 0)
     {
-        rocksdb_block_based_table_options_t *table_options = get_table_options(1024ULL * 1024 * 16);
+        rocksdb_block_based_table_options_t *table_options = get_table_options(1024ULL * 1024 * 1);
         cf_options = get_small_cf_options (table_options);
     }
     else if (strncmp("HASH_ORP_BLOCK", cf_name, strlen("HASH_ORP_BLOCK")) == 0)
@@ -235,8 +231,13 @@ static const struct rocksdb_options_t* get_cf_options(const char* cf_name)
     }
     else if (strncmp("HASH_BLOCK_INTERNAL", cf_name, strlen("HASH_BLOCK_INTERNAL")) == 0)
     {
-        rocksdb_block_based_table_options_t *table_options = get_table_options(1024ULL * 1024 * 1024);
+        rocksdb_block_based_table_options_t *table_options = get_table_options( 1024ULL * 1024 * 1024 * 8);
         cf_options = get_base_cf_options(table_options, memtable_size_bytes);
+        // hash index is enabled for block based table. It would use 5% more storage space
+        // but speed up the random read by 50% compared to normal binary search index.
+        rocksdb_block_based_options_set_index_type(table_options, 1);
+        rocksdb_slicetransform_t* slicetransform = rocksdb_slicetransform_create_fixed_prefix(32);
+        rocksdb_options_set_prefix_extractor(cf_options, slicetransform);
     }
     else if (strncmp("HASH_BLOCK_OUR", cf_name, strlen("HASH_BLOCK_OUR")) == 0)
     {
@@ -245,17 +246,17 @@ static const struct rocksdb_options_t* get_cf_options(const char* cf_name)
     }
     else if (strncmp("HASH_BLOCK_REMARK", cf_name, strlen("HASH_BLOCK_REMARK")) == 0)
     {
-        rocksdb_block_based_table_options_t *table_options = get_table_options(1024ULL * 1024 * 64);
+        rocksdb_block_based_table_options_t *table_options = get_table_options(1024ULL * 1024 * 32);
         cf_options = get_base_cf_options(table_options, memtable_size_bytes);
     }
     else if (strncmp("HASH_BLOCK_BACKREF", cf_name, strlen("HASH_BLOCK_BACKREF")) == 0)
     {
-        rocksdb_block_based_table_options_t *table_options = get_table_options(1024ULL * 1024 * 64);
+        rocksdb_block_based_table_options_t *table_options = get_table_options(1024ULL * 1024 * 32);
         cf_options = get_base_cf_options(table_options, memtable_size_bytes);
     }
     else if (strncmp("HASH_BLOCK_CACHE", cf_name, strlen("HASH_BLOCK_CACHE")) == 0)
     {
-        rocksdb_block_based_table_options_t *table_options = get_table_options(1024ULL * 1024 * 64);
+        rocksdb_block_based_table_options_t *table_options = get_table_options(1024ULL * 1024 * 1024 * 1);
         cf_options = get_base_cf_options(table_options, memtable_size_bytes);
     }
     else if (strncmp("HEIGHT_BLOCK", cf_name, strlen("HEIGHT_BLOCK")) == 0)
@@ -276,6 +277,8 @@ static const struct rocksdb_options_t* get_cf_options(const char* cf_name)
  */
 xd_rsdb_op_t xd_rsdb_column_conf(xd_rsdb_t  *db)
 {
+    rocksdb_options_enable_statistics(db->options);
+
     // [0] internal block(key="num", value="SETTING")
     db->cf->colum_name[SETTING] = "SETTING";
     db->cf->column_option[SETTING] = get_cf_options("SETTING");
